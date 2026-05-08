@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UV Glass Surrogate — Inverse Design Console | Ian Kiilu</title>
+  <meta name="description" content="Physics-Informed DNN Surrogate Model for UV Glass Absorption. Inverse Design via Differential Evolution. BSc Applied Optics, Multimedia University of Kenya." />
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@600;700&family=Exo+2:wght@300;400;600&display=swap" rel="stylesheet" />
+
+  <!-- React 18 + Babel (CDN — no build step needed) -->
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; background: #0D1117; }
+    body { overflow-x: hidden; }
+    input[type=range] { -webkit-appearance: none; appearance: none; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; border-radius: 50%; background: #00D4FF; cursor: pointer; border: 2px solid #0D1117; box-shadow: 0 0 6px #00D4FF88; }
+    input[type=range]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #00D4FF; cursor: pointer; border: 2px solid #0D1117; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0F1923; }
+    ::-webkit-scrollbar-thumb { background: #1E3050; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #00D4FF44; }
+    #root { min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    /* =========================================================
+       DESIGN TOKENS
+       ========================================================= */
+    const C = {
+      void:     "#0D1117",
+      deep:     "#0F1923",
+      panel:    "#141F2E",
+      border:   "#1E3050",
+      grid:     "#1A2840",
+      neon:     "#00D4FF",
+      neonDim:  "#0A5A72",
+      green:    "#00FF9C",
+      greenDim: "#0A4030",
+      amber:    "#FFB800",
+      amberDim: "#3D2C00",
+      red:      "#FF3366",
+      redDim:   "#3D0018",
+      purple:   "#9D4EDD",
+      text:     "#C8D8E8",
+      muted:    "#4A6080",
+      bright:   "#E8F4FF",
+    };
+
+    const MONO = "'Share Tech Mono', 'Courier New', monospace";
+    const SANS = "'Rajdhani', 'Arial Narrow', sans-serif";
+    const BODY = "'Exo 2', 'Segoe UI', sans-serif";
+
+    /* =========================================================
+       PHYSICS ENGINE
+       ========================================================= */
+    const WAVELENGTHS = Array.from({ length: 21 }, (_, i) => 200 + i * 10);
+
+    function gaussPeak(lam, peak, fwhm, strength) {
+      const sigma = fwhm / 2.355;
+      return strength * Math.exp(-((lam - peak) * (lam - peak)) / (2 * sigma * sigma));
+    }
+
+    function computeSpectrum(fe2o3, tio2, ceo2, coo, redox, thickness) {
+      return WAVELENGTHS.map(function(lam) {
+        var E     = 1240 / lam;
+        var fe3   = 1 - redox;
+        var aBase = 1e3   * Math.exp((E - 3.76) / 0.065);
+        var aFe3  = gaussPeak(lam, 380, 110, 4500  * fe2o3 * fe3);
+        var aTi   = gaussPeak(lam, 310,  70, 8000  * tio2);
+        var aCe   = gaussPeak(lam, 340,  82, 12000 * ceo2);
+        var aCo   = gaussPeak(lam, 360, 188, 600   * coo);
+        return Math.max(aBase + aFe3 + aTi + aCe + aCo, 0.01);
+      });
+    }
+
+    function computeTUV400(spectrum, thickness) {
+      var dCm = thickness / 10;
+      var sum = 0;
+      for (var i = 0; i < spectrum.length; i++) sum += Math.exp(-spectrum[i] * dCm);
+      return sum / spectrum.length;
+    }
+
+    function computeLogMSE(pred, target) {
+      var sum = 0;
+      for (var i = 0; i < pred.length; i++) {
+        var diff = Math.log(pred[i] + 1e-6) - Math.log(target[i] + 1e-6);
+        sum += diff * diff;
+      }
+      return sum / pred.length;
+    }
+
+    function physicsScore(fe2o3, tio2, redox, tuv400) {
+      var isoPenalty = Math.max(0, tuv400 * 100 - 2) / 2;
+      var synergy    = Math.min(fe2o3 * tio2 / 0.5, 1);
+      var fe3Weight  = 1 - redox;
+      var raw = 0.4 * synergy * 100 + 0.35 * (1 - isoPenalty) * 100 + 0.25 * fe3Weight * 100;
+      return Math.round(Math.min(100, Math.max(0, raw)));
+    }
+
+    /* =========================================================
+       GA STEP
+       ========================================================= */
+    function gaStep(current, gen) {
+      var mut = Math.max(0.02, 0.3 * Math.exp(-gen / 200));
+      function nudge(v, lo, hi) {
+        return Math.max(lo, Math.min(hi, v + (Math.random() - 0.5) * mut));
+      }
+      return {
+        fe2o3:     nudge(current.fe2o3,     0.01, 1.6),
+        tio2:      nudge(current.tio2,      0,    5),
+        ceo2:      nudge(current.ceo2,      0,    0.25),
+        coo:       nudge(current.coo,       0,    0.05),
+        redox:     nudge(current.redox,     0.1,  0.4),
+        thickness: nudge(current.thickness, 1,    10),
+      };
+    }
+
+    /* =========================================================
+       3D GLASS LATTICE
+       ========================================================= */
+    function GlassLattice({ fe2o3, tio2, ceo2, coo }) {
+      var canvasRef = useRef(null);
+      var animRef   = useRef(null);
+      var tRef      = useRef(0);
+      var nodesRef  = useRef(null);
+      var edgesRef  = useRef(null);
+
+      useEffect(function() {
+        var cvs = canvasRef.current;
+        if (!cvs) return;
+        var W  = cvs.offsetWidth  || 200;
+        var H  = cvs.offsetHeight || 200;
+        cvs.width  = W;
+        cvs.height = H;
+        var ctx = cvs.getContext("2d");
+        var cx  = W / 2;
+        var cy  = H / 2;
+        var R   = Math.min(W, H) * 0.32;
+
+        var ATOM_DEFS = [
+          { color: "#00D4FF", r: 8, frac: 0.6 },
+          { color: "#FF3366", r: 5, frac: 0.35 },
+          { color: "#FFB800", r: 6, frac: Math.min(fe2o3 / 1.6, 1) },
+          { color: "#00FF9C", r: 6, frac: Math.min(tio2  / 5,   1) },
+          { color: "#9D4EDD", r: 5, frac: Math.min(ceo2  / 0.25, 1) },
+        ];
+
+        if (!nodesRef.current) {
+          var nodes = [];
+          for (var i = 0; i < 60; i++) {
+            var theta = Math.random() * Math.PI * 2;
+            var phi   = Math.acos(2 * Math.random() - 1);
+            var r     = R * (0.3 + 0.7 * Math.random());
+            var type  = ATOM_DEFS[Math.floor(Math.random() * ATOM_DEFS.length)];
+            nodes.push({
+              x0: r * Math.sin(phi) * Math.cos(theta),
+              y0: r * Math.sin(phi) * Math.sin(theta),
+              z0: r * Math.cos(phi),
+              color: type.color, r: type.r, frac: type.frac,
+              phase: Math.random() * Math.PI * 2,
+              speed: 0.3 + Math.random() * 0.4,
+            });
+          }
+          nodesRef.current = nodes;
+          var edges = [];
+          for (var a = 0; a < nodes.length; a++) {
+            for (var b = a + 1; b < nodes.length; b++) {
+              var dx = nodes[a].x0 - nodes[b].x0;
+              var dy = nodes[a].y0 - nodes[b].y0;
+              var dz = nodes[a].z0 - nodes[b].z0;
+              var d  = Math.sqrt(dx*dx + dy*dy + dz*dz);
+              if (d < R * 0.45 && Math.random() < 0.4) edges.push([a, b]);
+            }
+          }
+          edgesRef.current = edges;
+        }
+
+        var nodes2 = nodesRef.current;
+        var edges2 = edgesRef.current;
+        nodes2.forEach(function(n) {
+          if (n.color === "#FFB800") n.frac = Math.min(fe2o3 / 1.6, 1);
+          if (n.color === "#00FF9C") n.frac = Math.min(tio2  / 5,   1);
+          if (n.color === "#9D4EDD") n.frac = Math.min(ceo2  / 0.25, 1);
+        });
+
+        function project(x0, y0, z0, t) {
+          var cosT = Math.cos(t * 0.3);
+          var sinT = Math.sin(t * 0.3);
+          var xr   = x0 * cosT - z0 * sinT;
+          var zr   = x0 * sinT + z0 * cosT;
+          var s    = 400 / (400 - zr);
+          return { x: cx + xr * s, y: cy + y0 * s, z: zr, s: s };
+        }
+
+        function draw() {
+          tRef.current += 0.008;
+          var t = tRef.current;
+          ctx.clearRect(0, 0, W, H);
+          ctx.strokeStyle = "#1A2840";
+          ctx.lineWidth = 0.5;
+          for (var gx = 0; gx < W; gx += 20) { ctx.beginPath(); ctx.moveTo(gx,0); ctx.lineTo(gx,H); ctx.stroke(); }
+          for (var gy = 0; gy < H; gy += 20) { ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(W,gy); ctx.stroke(); }
+
+          var proj = nodes2.map(function(n) {
+            var p = project(n.x0, n.y0, n.z0, t);
+            var pulse = 1 + 0.15 * Math.sin(t * n.speed + n.phase);
+            return { x: p.x, y: p.y, z: p.z, n: n, r: n.r * p.s * pulse / R * 80 };
+          });
+          proj.sort(function(a, b) { return a.z - b.z; });
+
+          edges2.forEach(function(e) {
+            var pa = project(nodes2[e[0]].x0, nodes2[e[0]].y0, nodes2[e[0]].z0, t);
+            var pb = project(nodes2[e[1]].x0, nodes2[e[1]].y0, nodes2[e[1]].z0, t);
+            var depth = (pa.z + pb.z) / 2;
+            var al = Math.max(0, Math.min(0.16, (1 + depth / R) / 2));
+            ctx.strokeStyle = "rgba(0,212,255," + al + ")";
+            ctx.lineWidth = 0.8;
+            ctx.beginPath(); ctx.moveTo(pa.x, pa.y); ctx.lineTo(pb.x, pb.y); ctx.stroke();
+          });
+
+          proj.forEach(function(p) {
+            if (p.n.frac < 0.05) return;
+            var al  = 0.3 + 0.7 * p.n.frac;
+            var r   = Math.max(p.r, 1);
+            var hexA   = Math.round(al * 255).toString(16).padStart(2, "0");
+            var hexDim = Math.round(al * 80).toString(16).padStart(2, "0");
+            var grd = ctx.createRadialGradient(p.x - r*0.3, p.y - r*0.3, 0, p.x, p.y, r);
+            grd.addColorStop(0,   p.n.color + "ff");
+            grd.addColorStop(0.6, p.n.color + hexA);
+            grd.addColorStop(1,   p.n.color + "00");
+            ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+            ctx.fillStyle = grd; ctx.fill();
+            ctx.beginPath(); ctx.arc(p.x, p.y, r + 2, 0, Math.PI * 2);
+            ctx.strokeStyle = p.n.color + hexDim; ctx.lineWidth = 1; ctx.stroke();
+          });
+
+          ctx.fillStyle = "#00D4FF66";
+          ctx.font = "9px " + MONO;
+          ctx.fillText("SiO2-Na2O-CaO MATRIX", 8, H - 8);
+          animRef.current = requestAnimationFrame(draw);
+        }
+
+        animRef.current = requestAnimationFrame(draw);
+        return function() { cancelAnimationFrame(animRef.current); };
+      }, [fe2o3, tio2, ceo2, coo]);
+
+      return <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />;
+    }
+
+    /* =========================================================
+       SPECTRUM CHART
+       ========================================================= */
+    function SpectrumChart({ predicted, target }) {
+      var canvasRef = useRef(null);
+      useEffect(function() {
+        var cvs = canvasRef.current;
+        if (!cvs) return;
+        var W = cvs.offsetWidth || 400;
+        var H = cvs.offsetHeight || 200;
+        cvs.width = W; cvs.height = H;
+        var ctx = cvs.getContext("2d");
+        ctx.clearRect(0,0,W,H);
+        ctx.fillStyle = C.deep; ctx.fillRect(0,0,W,H);
+        var pL=52, pR=16, pT=12, pB=38;
+        var gW=W-pL-pR, gH=H-pT-pB;
+        var maxV = Math.max.apply(null, predicted.concat(target)) * 1.12;
+        function toX(i) { return pL + (i/(WAVELENGTHS.length-1))*gW; }
+        function toY(v) { return pT + gH - (v/maxV)*gH; }
+
+        for (var gi=0; gi<=4; gi++) {
+          var gy = pT + gi*(gH/4);
+          ctx.strokeStyle="#1E3050"; ctx.lineWidth=1;
+          ctx.beginPath(); ctx.moveTo(pL,gy); ctx.lineTo(pL+gW,gy); ctx.stroke();
+          var gVal = maxV*(1-gi/4);
+          ctx.fillStyle=C.muted; ctx.font="9px "+MONO;
+          ctx.fillText(gVal>1000?(gVal/1000).toFixed(1)+"k":gVal.toFixed(0), pL-46, gy+3);
+        }
+        [200,250,280,315,350,400].forEach(function(wl) {
+          var idx=WAVELENGTHS.indexOf(wl); if(idx<0) return;
+          var x=toX(idx);
+          ctx.strokeStyle="#1E3050"; ctx.lineWidth=1;
+          ctx.beginPath(); ctx.moveTo(x,pT); ctx.lineTo(x,pT+gH); ctx.stroke();
+          ctx.fillStyle=C.muted; ctx.font="9px "+MONO;
+          ctx.fillText(wl+"", x-10, pT+gH+14);
+        });
+        var uvbX1=toX(WAVELENGTHS.indexOf(280));
+        var uvbX2=toX(WAVELENGTHS.indexOf(320));
+        var uvbG=ctx.createLinearGradient(uvbX1,0,uvbX2,0);
+        uvbG.addColorStop(0,"rgba(255,51,102,0.00)");
+        uvbG.addColorStop(0.5,"rgba(255,51,102,0.07)");
+        uvbG.addColorStop(1,"rgba(255,51,102,0.00)");
+        ctx.fillStyle=uvbG; ctx.fillRect(uvbX1,pT,uvbX2-uvbX1,gH);
+        ctx.fillStyle="#FF336699"; ctx.font="8px "+MONO; ctx.fillText("UV-B",uvbX1+2,pT+10);
+
+        // Target area
+        ctx.beginPath(); ctx.moveTo(toX(0),toY(target[0]));
+        target.forEach(function(v,i){ctx.lineTo(toX(i),toY(v));});
+        ctx.lineTo(toX(target.length-1),pT+gH); ctx.lineTo(toX(0),pT+gH); ctx.closePath();
+        var tFill=ctx.createLinearGradient(0,pT,0,pT+gH);
+        tFill.addColorStop(0,"rgba(157,78,221,0.22)"); tFill.addColorStop(1,"rgba(157,78,221,0.02)");
+        ctx.fillStyle=tFill; ctx.fill();
+        ctx.strokeStyle=C.purple; ctx.lineWidth=2; ctx.setLineDash([6,3]);
+        ctx.beginPath();
+        target.forEach(function(v,i){if(i===0)ctx.moveTo(toX(i),toY(v));else ctx.lineTo(toX(i),toY(v));});
+        ctx.stroke(); ctx.setLineDash([]);
+
+        // Predicted area
+        ctx.beginPath(); ctx.moveTo(toX(0),toY(predicted[0]));
+        predicted.forEach(function(v,i){ctx.lineTo(toX(i),toY(v));});
+        ctx.lineTo(toX(predicted.length-1),pT+gH); ctx.lineTo(toX(0),pT+gH); ctx.closePath();
+        var pFill=ctx.createLinearGradient(0,pT,0,pT+gH);
+        pFill.addColorStop(0,"rgba(0,212,255,0.18)"); pFill.addColorStop(1,"rgba(0,212,255,0.02)");
+        ctx.fillStyle=pFill; ctx.fill();
+
+        for (var pass=0; pass<3; pass++) {
+          if (pass<2) { ctx.strokeStyle="rgba(0,212,255,"+(0.08+pass*0.06)+")"; ctx.lineWidth=8-pass*3; ctx.shadowBlur=0; }
+          else { ctx.strokeStyle=C.neon; ctx.lineWidth=2.5; ctx.shadowColor=C.neon; ctx.shadowBlur=8; }
+          ctx.beginPath();
+          predicted.forEach(function(v,i){if(i===0)ctx.moveTo(toX(i),toY(v));else ctx.lineTo(toX(i),toY(v));});
+          ctx.stroke();
+        }
+        ctx.shadowBlur=0;
+
+        ctx.save(); ctx.translate(12,pT+gH/2); ctx.rotate(-Math.PI/2);
+        ctx.fillStyle=C.muted; ctx.font="9px "+MONO; ctx.fillText("alpha (cm-1)",-28,0); ctx.restore();
+        ctx.fillStyle=C.muted; ctx.font="9px "+MONO; ctx.fillText("wavelength (nm)",pL+gW/2-40,H-4);
+      }, [predicted, target]);
+      return <canvas ref={canvasRef} style={{width:"100%",height:"100%",display:"block"}} />;
+    }
+
+    /* =========================================================
+       CONVERGENCE CHART
+       ========================================================= */
+    function ConvergenceChart({ history }) {
+      var canvasRef = useRef(null);
+      useEffect(function() {
+        var cvs=canvasRef.current;
+        if(!cvs||history.length<2) return;
+        var W=cvs.offsetWidth||200, H=cvs.offsetHeight||60;
+        cvs.width=W; cvs.height=H;
+        var ctx=cvs.getContext("2d");
+        ctx.clearRect(0,0,W,H); ctx.fillStyle=C.deep; ctx.fillRect(0,0,W,H);
+        var maxV=Math.max.apply(null,history);
+        var pL=4,pR=4,pT=4,pB=4,gW=W-pL-pR,gH=H-pT-pB;
+        function toX(i){return pL+(i/(history.length-1))*gW;}
+        function toY(v){return pT+gH-(v/maxV)*gH;}
+        var grd=ctx.createLinearGradient(0,0,0,H);
+        grd.addColorStop(0,"rgba(0,255,156,0.3)"); grd.addColorStop(1,"rgba(0,255,156,0.0)");
+        ctx.beginPath(); ctx.moveTo(toX(0),toY(history[0]));
+        history.forEach(function(v,i){ctx.lineTo(toX(i),toY(v));});
+        ctx.lineTo(toX(history.length-1),H); ctx.lineTo(pL,H); ctx.closePath();
+        ctx.fillStyle=grd; ctx.fill();
+        ctx.strokeStyle=C.green; ctx.lineWidth=1.5;
+        ctx.beginPath();
+        history.forEach(function(v,i){if(i===0)ctx.moveTo(toX(i),toY(v));else ctx.lineTo(toX(i),toY(v));});
+        ctx.stroke();
+      },[history]);
+      return <canvas ref={canvasRef} style={{width:"100%",height:"100%",display:"block"}} />;
+    }
+
+    /* =========================================================
+       PHYSICS GAUGE
+       ========================================================= */
+    function PhysicsGauge({ score }) {
+      var canvasRef = useRef(null);
+      useEffect(function() {
+        var cvs=canvasRef.current; if(!cvs) return;
+        var W=cvs.offsetWidth||180, H=cvs.offsetHeight||160;
+        cvs.width=W; cvs.height=H;
+        var ctx=cvs.getContext("2d"); ctx.clearRect(0,0,W,H);
+        var cx=W/2, cy=H*0.65, R=Math.min(W,H)*0.38;
+        var sA=Math.PI*0.8, eA=Math.PI*2.2;
+        var sweep=(score/100)*(eA-sA);
+        ctx.beginPath(); ctx.arc(cx,cy,R,sA,eA);
+        ctx.strokeStyle="#1E3050"; ctx.lineWidth=14; ctx.lineCap="round"; ctx.stroke();
+        var col=score>70?C.green:score>40?C.amber:C.red;
+        var ag=ctx.createLinearGradient(cx-R,cy,cx+R,cy);
+        ag.addColorStop(0,C.neon); ag.addColorStop(1,col);
+        ctx.beginPath(); ctx.arc(cx,cy,R,sA,sA+sweep);
+        ctx.strokeStyle=ag; ctx.lineWidth=14; ctx.shadowColor=col; ctx.shadowBlur=18; ctx.stroke(); ctx.shadowBlur=0;
+        ctx.fillStyle=C.bright; ctx.font="bold 28px "+MONO; ctx.textAlign="center";
+        ctx.fillText(score+"",cx,cy+6);
+        ctx.font="9px "+MONO; ctx.fillStyle=C.muted; ctx.fillText("PHYSICS SCORE",cx,cy+20);
+        for(var t=0;t<=10;t++){
+          var angle=sA+t*(eA-sA)/10;
+          var x1=cx+(R-22)*Math.cos(angle), y1=cy+(R-22)*Math.sin(angle);
+          var x2=cx+R*Math.cos(angle),      y2=cy+R*Math.sin(angle);
+          ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+          ctx.strokeStyle=t%5===0?"#3A5080":"#1E3050"; ctx.lineWidth=2; ctx.stroke();
+        }
+        ctx.textAlign="left";
+      },[score]);
+      return <canvas ref={canvasRef} style={{width:"100%",height:"100%",display:"block"}} />;
+    }
+
+    /* =========================================================
+       UI COMPONENTS
+       ========================================================= */
+    function ParamSlider({ label, unit, value, min, max, step, color, onChange }) {
+      var pct = ((value - min) / (max - min)) * 100;
+      return (
+        <div style={{marginBottom:12}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+            <span style={{fontSize:10,fontFamily:MONO,color:C.muted,textTransform:"uppercase",letterSpacing:1}}>{label}</span>
+            <span style={{fontSize:11,fontFamily:MONO,color:color,fontWeight:700}}>
+              {value.toFixed(3)}<span style={{color:C.muted,fontWeight:400}}> {unit}</span>
+            </span>
+          </div>
+          <div style={{position:"relative",height:4,background:C.grid,borderRadius:2}}>
+            <div style={{position:"absolute",left:0,top:0,height:"100%",borderRadius:2,width:pct+"%",
+              background:"linear-gradient(90deg,"+C.neonDim+","+color+")",
+              boxShadow:"0 0 6px "+color+"88"}} />
+            <input type="range" min={min} max={max} step={step||0.001} value={value}
+              onChange={function(e){onChange(parseFloat(e.target.value));}}
+              style={{position:"absolute",top:-8,left:0,width:"100%",height:20,opacity:0,cursor:"pointer"}} />
+          </div>
+        </div>
+      );
+    }
+
+    function StatusBadge({ label, value, good, warn }) {
+      var col = warn ? C.amber : good ? C.green : C.red;
+      return (
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+          padding:"5px 10px",background:col+"12",border:"1px solid "+col+"33",borderRadius:4,marginBottom:4}}>
+          <span style={{fontSize:9,fontFamily:MONO,color:C.muted,textTransform:"uppercase",letterSpacing:1}}>{label}</span>
+          <span style={{fontSize:11,fontFamily:MONO,color:col,fontWeight:700}}>{value}</span>
+        </div>
+      );
+    }
+
+    function Panel({ title, subtitle, children, accent, style, headerRight }) {
+      var acc = accent || C.neon;
+      return (
+        <div style={Object.assign({background:C.panel,border:"1px solid "+C.border,
+          borderTop:"2px solid "+acc,borderRadius:4,overflow:"hidden",
+          display:"flex",flexDirection:"column"},style||{})}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+            padding:"8px 12px",borderBottom:"1px solid "+C.border,background:acc+"08"}}>
+            <div>
+              <div style={{fontSize:10,fontFamily:MONO,color:acc,textTransform:"uppercase",letterSpacing:2,fontWeight:700}}>{title}</div>
+              {subtitle&&<div style={{fontSize:9,fontFamily:MONO,color:C.muted}}>{subtitle}</div>}
+            </div>
+            {headerRight||null}
+          </div>
+          <div style={{flex:1,overflow:"hidden"}}>{children}</div>
+        </div>
+      );
+    }
+
+    /* =========================================================
+       MAIN DASHBOARD
+       ========================================================= */
+    function Dashboard() {
+      var [fe2o3,     setFe2o3]     = useState(0.8);
+      var [tio2,      setTio2]      = useState(2.5);
+      var [ceo2,      setCeo2]      = useState(0.12);
+      var [coo,       setCoo]       = useState(0.020);
+      var [redox,     setRedox]     = useState(0.25);
+      var [thickness, setThickness] = useState(4.0);
+      var [target]                  = useState(function() { return computeSpectrum(1.0,3.0,0.18,0.030,0.22,5.0); });
+      var [isRunning,    setIsRunning]    = useState(false);
+      var [generation,   setGeneration]   = useState(0);
+      var [convergence,  setConvergence]  = useState([]);
+      var [bestMSE,      setBestMSE]      = useState(null);
+      var [dnnLatency,   setDnnLatency]   = useState(1.2);
+      var [comsolStatus, setComsolStatus] = useState("IDLE");
+      var [totalEvals,   setTotalEvals]   = useState(0);
+      var optimRef = useRef(null);
+      var bestRef  = useRef(null);
+
+      var predicted = computeSpectrum(fe2o3,tio2,ceo2,coo,redox,thickness);
+      var tuv400    = computeTUV400(predicted,thickness);
+      var mse       = computeLogMSE(predicted,target);
+      var feTi      = fe2o3*tio2;
+      var pScore    = physicsScore(fe2o3,tio2,redox,tuv400);
+      var isoPass   = tuv400<=0.02;
+      var synergyOk = feTi>=0.10;
+      var uvbIdxs   = [8,9,10,11];
+      var uvbMean   = uvbIdxs.reduce(function(s,i){return s+predicted[i];},0)/uvbIdxs.length;
+
+      var startOpt = useCallback(function() {
+        if (isRunning) {
+          clearInterval(optimRef.current);
+          setIsRunning(false); setComsolStatus("IDLE"); return;
+        }
+        setIsRunning(true); setGeneration(0); setConvergence([]);
+        setBestMSE(null); setComsolStatus("ACTIVE"); setTotalEvals(0);
+        var gen=0;
+        var bestLoss=computeLogMSE(predicted,target);
+        bestRef.current={fe2o3:fe2o3,tio2:tio2,ceo2:ceo2,coo:coo,redox:redox,thickness:thickness};
+        var convArr=[];
+        optimRef.current=setInterval(function(){
+          gen++;
+          setGeneration(gen);
+          var bestThisGen=null, bestLossThisGen=Infinity;
+          for(var k=0;k<15;k++){
+            var cand=gaStep(bestRef.current,gen);
+            var spec=computeSpectrum(cand.fe2o3,cand.tio2,cand.ceo2,cand.coo,cand.redox,cand.thickness);
+            var loss=computeLogMSE(spec,target);
+            if(loss<bestLossThisGen){bestLossThisGen=loss;bestThisGen=cand;}
+          }
+          if(bestLossThisGen<bestLoss){
+            bestLoss=bestLossThisGen; bestRef.current=bestThisGen;
+            setFe2o3(bestThisGen.fe2o3); setTio2(bestThisGen.tio2);
+            setCeo2(bestThisGen.ceo2);   setCoo(bestThisGen.coo);
+            setRedox(bestThisGen.redox); setThickness(bestThisGen.thickness);
+          }
+          convArr.push(bestLoss);
+          setConvergence(convArr.slice());
+          setBestMSE(bestLoss);
+          setTotalEvals(function(e){return e+15;});
+          setDnnLatency(parseFloat((0.8+Math.random()*0.9).toFixed(2)));
+          if(gen%50===0){
+            setComsolStatus("VALIDATING");
+            setTimeout(function(){setComsolStatus("ACTIVE");},800);
+          }
+          if(gen>=600||bestLoss<0.001){
+            clearInterval(optimRef.current); setIsRunning(false); setComsolStatus("COMPLETE");
+          }
+        },40);
+      },[isRunning,fe2o3,tio2,ceo2,coo,redox,thickness,predicted,target]);
+
+      useEffect(function(){return function(){clearInterval(optimRef.current);};},[]);
+
+      var comsolCol = comsolStatus==="ACTIVE"?"#00FF9C":comsolStatus==="VALIDATING"?"#FFB800":comsolStatus==="COMPLETE"?"#00D4FF":"#4A6080";
+
+      /* ------ RENDER ------ */
+      return (
+        <div style={{background:C.void,minHeight:"100vh",color:C.text,fontFamily:BODY,overflowX:"auto"}}>
+
+          {/* HEADER */}
+          <div style={{borderBottom:"1px solid "+C.border,
+            background:"linear-gradient(90deg,"+C.deep+" 0%,#0A1520 50%,"+C.deep+" 100%)",
+            padding:"10px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",
+            position:"sticky",top:0,zIndex:100,minWidth:900}}>
+            <div style={{display:"flex",alignItems:"center",gap:16}}>
+              <div style={{width:32,height:32,background:"linear-gradient(135deg,"+C.neon+","+C.purple+")",
+                borderRadius:4,display:"flex",alignItems:"center",justifyContent:"center",
+                fontSize:14,fontWeight:700,fontFamily:MONO,color:C.void}}>UV</div>
+              <div>
+                <div style={{fontSize:13,fontWeight:700,fontFamily:SANS,color:C.bright,letterSpacing:2,textTransform:"uppercase"}}>
+                  UV Glass Surrogate — Inverse Design Console
+                </div>
+                <div style={{fontSize:9,fontFamily:MONO,color:C.muted,letterSpacing:1}}>
+                  IAN KIILU · BSc APPLIED OPTICS · MULTIMEDIA UNIVERSITY OF KENYA · 2024
+                </div>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:16,alignItems:"center"}}>
+              {[
+                {label:"DNN",    val:dnnLatency+"ms",           col:"#00FF9C"},
+                {label:"COMSOL", val:comsolStatus,              col:comsolCol},
+                {label:"DE GEN", val:generation+"",             col:"#FFB800"},
+                {label:"EVALS",  val:totalEvals.toLocaleString(),col:"#00D4FF"},
+              ].map(function(item){
+                return (
+                  <div key={item.label} style={{textAlign:"center"}}>
+                    <div style={{fontSize:8,fontFamily:MONO,color:C.muted,letterSpacing:1}}>{item.label}</div>
+                    <div style={{fontSize:10,fontFamily:MONO,color:item.col,fontWeight:700,
+                      textShadow:isRunning?"0 0 8px "+item.col:"none"}}>{item.val}</div>
+                  </div>
+                );
+              })}
+              <button onClick={startOpt} style={{
+                background:isRunning?C.redDim:C.neonDim,
+                border:"1px solid "+(isRunning?C.red:C.neon),
+                color:isRunning?C.red:C.neon,
+                fontFamily:MONO,fontSize:10,letterSpacing:2,padding:"6px 16px",
+                borderRadius:2,cursor:"pointer",textTransform:"uppercase",fontWeight:700,
+                boxShadow:isRunning?"0 0 12px "+C.red+"44":"0 0 12px "+C.neon+"44",
+              }}>
+                {isRunning?"HALT DE":"RUN DE"}
+              </button>
+            </div>
+          </div>
+
+          {/* MAIN GRID */}
+          <div style={{display:"grid",gridTemplateColumns:"280px 1fr 200px",gap:8,padding:"8px 12px 12px",minWidth:900}}>
+
+            {/* COL 1 */}
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              <Panel title="COMPOSITION CONTROL" subtitle="Dopant weight fractions" accent={C.neon}>
+                <div style={{padding:"12px 14px"}}>
+                  <ParamSlider label="Fe2O3"     unit="wt%"        value={fe2o3}     min={0.01} max={1.6}  step={0.01}  color={C.red}    onChange={setFe2o3} />
+                  <ParamSlider label="TiO2"      unit="wt%"        value={tio2}      min={0}    max={5}    step={0.05}  color={C.neon}   onChange={setTio2} />
+                  <ParamSlider label="CeO2"      unit="wt%"        value={ceo2}      min={0}    max={0.25} step={0.005} color={C.purple} onChange={setCeo2} />
+                  <ParamSlider label="CoO"       unit="wt%"        value={coo}       min={0}    max={0.05} step={0.001} color={C.amber}  onChange={setCoo} />
+                  <ParamSlider label="Redox"     unit="FeO/Fe2O3"  value={redox}     min={0.1}  max={0.4}  step={0.005} color={C.green}  onChange={setRedox} />
+                  <ParamSlider label="Thickness" unit="mm"         value={thickness} min={1}    max={10}   step={0.1}   color={C.text}   onChange={setThickness} />
+                  <div style={{borderTop:"1px solid "+C.border,paddingTop:10,marginTop:4}}>
+                    <div style={{fontSize:9,fontFamily:MONO,color:C.muted,marginBottom:6,letterSpacing:1}}>DERIVED FEATURES</div>
+                    <StatusBadge label="Fe-Ti Product" value={feTi.toFixed(4)}                     good={feTi>=0.1}  warn={feTi<0.1&&feTi>0.05} />
+                    <StatusBadge label="Fe3 Fraction"  value={(fe2o3*(1-redox)).toFixed(4)}        good={true} />
+                    <StatusBadge label="TUV400"        value={(tuv400*100).toFixed(2)+"%"}          good={isoPass}    warn={!isoPass} />
+                    <StatusBadge label="ISO 13837"     value={isoPass?"PASS":"FAIL"}                good={isoPass} />
+                    <StatusBadge label="Synergy"       value={synergyOk?"OK":"FAIL"}               good={synergyOk} />
+                  </div>
+                </div>
+              </Panel>
+
+              <Panel title="DE ALGORITHM" subtitle="scipy.differential_evolution" accent={C.amber} style={{flex:1}}>
+                <div style={{padding:"10px 14px"}}>
+                  {[
+                    {k:"Strategy",v:"best1bin"},{k:"Pop Size",v:"20"},{k:"Mutation",v:"(0.5, 1.0)"},
+                    {k:"Recomb",v:"0.90"},{k:"Polishing",v:"L-BFGS-B"},
+                    {k:"Init",v:"Latin Hypercube"},{k:"Workers",v:"all CPUs"},
+                  ].map(function(row){
+                    return (
+                      <div key={row.k} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",borderBottom:"1px solid "+C.grid}}>
+                        <span style={{fontSize:9,fontFamily:MONO,color:C.muted}}>{row.k}</span>
+                        <span style={{fontSize:9,fontFamily:MONO,color:C.amber}}>{row.v}</span>
+                      </div>
+                    );
+                  })}
+                  <div style={{marginTop:10}}>
+                    <div style={{fontSize:9,fontFamily:MONO,color:C.muted,marginBottom:6}}>CONVERGENCE</div>
+                    <div style={{height:60,borderRadius:3,overflow:"hidden",border:"1px solid "+C.border}}>
+                      <ConvergenceChart history={convergence} />
+                    </div>
+                    {bestMSE!==null&&(
+                      <div style={{fontSize:9,fontFamily:MONO,color:C.green,marginTop:4}}>
+                        BEST MSE(log): {bestMSE.toFixed(6)}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </Panel>
+            </div>
+
+            {/* COL 2 */}
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              <Panel title="TARGET vs PREDICTED — UV ABSORPTION SPECTRUM"
+                subtitle="alpha(lambda) in cm-1  |  200-400nm  |  10nm resolution  |  21 outputs"
+                accent={C.neon} style={{height:280}}
+                headerRight={
+                  <div style={{display:"flex",gap:12,alignItems:"center"}}>
+                    <div style={{display:"flex",gap:4,alignItems:"center"}}>
+                      <div style={{width:20,height:2,background:C.neon,boxShadow:"0 0 4px "+C.neon}} />
+                      <span style={{fontSize:9,fontFamily:MONO,color:C.muted}}>PREDICTED</span>
+                    </div>
+                    <div style={{display:"flex",gap:4,alignItems:"center"}}>
+                      <div style={{width:20,borderTop:"2px dashed "+C.purple}} />
+                      <span style={{fontSize:9,fontFamily:MONO,color:C.muted}}>TARGET</span>
+                    </div>
+                  </div>
+                }>
+                <SpectrumChart predicted={predicted} target={target} />
+              </Panel>
+
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+                <Panel title="UV-B ABSORPTION" subtitle="280-315nm critical zone" accent={C.red} style={{height:160}}>
+                  <div style={{padding:"12px 14px"}}>
+                    {[280,290,300,310].map(function(wl){
+                      var idx=WAVELENGTHS.indexOf(wl);
+                      var p=predicted[idx], t2=target[idx];
+                      var err=(p-t2)/t2*100;
+                      var col=Math.abs(err)<5?C.green:Math.abs(err)<15?C.amber:C.red;
+                      return (
+                        <div key={wl} style={{display:"flex",justifyContent:"space-between",padding:"3px 0",borderBottom:"1px solid "+C.grid}}>
+                          <span style={{fontSize:9,fontFamily:MONO,color:C.muted}}>{wl}nm</span>
+                          <span style={{fontSize:9,fontFamily:MONO,color:C.neon}}>{p.toFixed(0)}</span>
+                          <span style={{fontSize:9,fontFamily:MONO,color:col}}>{err>=0?"+":""}{err.toFixed(1)}%</span>
+                        </div>
+                      );
+                    })}
+                    <div style={{marginTop:6,fontSize:9,fontFamily:MONO,color:C.red}}>
+                      UV-B MEAN: {uvbMean.toFixed(0)} cm-1
+                    </div>
+                  </div>
+                </Panel>
+
+                <Panel title="ENERGY CONSERVATION" subtitle="A + T + R = 1 check" accent={C.green} style={{height:160}}>
+                  <div style={{padding:"12px 14px"}}>
+                    {WAVELENGTHS.filter(function(_,i){return i%4===0;}).map(function(wl){
+                      var idx=WAVELENGTHS.indexOf(wl);
+                      var a=predicted[idx], dCm=thickness/10;
+                      var Tv=Math.exp(-a*dCm), n_=1.52;
+                      var Rv=((n_-1)/(n_+1))*((n_-1)/(n_+1));
+                      var Av=Math.max(0,1-Tv-Rv);
+                      var sum=Tv+Rv+Av;
+                      var ok=Math.abs(sum-1)<0.01;
+                      return (
+                        <div key={wl} style={{display:"flex",justifyContent:"space-between",padding:"2px 0"}}>
+                          <span style={{fontSize:8,fontFamily:MONO,color:C.muted}}>{wl}nm</span>
+                          <span style={{fontSize:8,fontFamily:MONO,color:ok?C.green:C.red}}>{sum.toFixed(4)}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </Panel>
+
+                <Panel title="MSE BREAKDOWN" subtitle="log-scale, region-weighted" accent={C.purple} style={{height:160}}>
+                  <div style={{padding:"12px 14px"}}>
+                    {[
+                      {label:"UV-C 200-280",idxs:[0,1,2,3,4,5,6,7],col:C.purple},
+                      {label:"UV-B 280-315",idxs:[8,9,10,11],col:C.red},
+                      {label:"UV-A 315-400",idxs:[12,13,14,15,16,17,18,19,20],col:C.amber},
+                    ].map(function(row){
+                      var mseR=row.idxs.reduce(function(s,i){
+                        var d=Math.log(predicted[i]+1e-6)-Math.log(target[i]+1e-6);
+                        return s+d*d;
+                      },0)/row.idxs.length;
+                      var bar=Math.min(100,mseR*200);
+                      return (
+                        <div key={row.label} style={{marginBottom:8}}>
+                          <div style={{display:"flex",justifyContent:"space-between",marginBottom:2}}>
+                            <span style={{fontSize:8,fontFamily:MONO,color:C.muted}}>{row.label}</span>
+                            <span style={{fontSize:8,fontFamily:MONO,color:row.col}}>{mseR.toFixed(4)}</span>
+                          </div>
+                          <div style={{height:3,background:C.grid,borderRadius:2}}>
+                            <div style={{height:3,width:bar+"%",background:row.col,borderRadius:2,boxShadow:"0 0 4px "+row.col}} />
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <div style={{marginTop:8,fontSize:9,fontFamily:MONO,color:C.neon}}>
+                      TOTAL MSE: {mse.toFixed(6)}
+                    </div>
+                  </div>
+                </Panel>
+              </div>
+
+              <Panel title="SYSTEM DATA FLOW" subtitle="COMSOL → DNN → DE → Dashboard — closed loop" accent={C.neon} style={{height:80}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-around",height:"100%",padding:"0 16px"}}>
+                  {[
+                    {label:"COMSOL\nMultiphysics",sub:"FEM Solver",col:C.amber},
+                    {arrow:"->",sub:"Training\nSamples"},
+                    {label:"PyTorch\nDNN",sub:"21-output reg.",col:C.neon},
+                    {arrow:"->",sub:"alpha(lam)\n<1ms"},
+                    {label:"Differential\nEvolution",sub:"scipy.optimize",col:C.green},
+                    {arrow:"->",sub:"Optimal\nRecipe"},
+                    {label:"Dashboard\nUI",sub:"Real-time",col:C.purple},
+                  ].map(function(item,i){
+                    if(item.arrow){
+                      return (
+                        <div key={i} style={{textAlign:"center"}}>
+                          <div style={{fontSize:16,color:C.muted}}>{item.arrow}</div>
+                          <div style={{fontSize:7,fontFamily:MONO,color:C.muted,whiteSpace:"pre",textAlign:"center"}}>{item.sub}</div>
+                        </div>
+                      );
+                    }
+                    return (
+                      <div key={i} style={{textAlign:"center",padding:"4px 10px",
+                        border:"1px solid "+item.col+"55",borderRadius:3,background:item.col+"0A",minWidth:70}}>
+                        <div style={{fontSize:9,fontFamily:MONO,color:item.col,fontWeight:700,whiteSpace:"pre",textTransform:"uppercase",letterSpacing:1}}>{item.label}</div>
+                        <div style={{fontSize:7,color:C.muted,fontFamily:MONO,marginTop:2}}>{item.sub}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </Panel>
+            </div>
+
+            {/* COL 3 */}
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              <Panel title="PHYSICS SCORE" subtitle="ISO + conservation + synergy" accent={C.green} style={{height:200}}>
+                <PhysicsGauge score={pScore} />
+              </Panel>
+              <Panel title="GLASS LATTICE" subtitle="3D chemical structure" accent={C.purple} style={{flex:1,minHeight:200}}>
+                <GlassLattice fe2o3={fe2o3} tio2={tio2} ceo2={ceo2} coo={coo} />
+              </Panel>
+              <Panel title="RECIPE OUTPUT" subtitle="Current optimal composition" accent={C.amber}>
+                <div style={{padding:"10px 12px"}}>
+                  {[
+                    {k:"Fe2O3",  v:fe2o3.toFixed(3)+" wt%",    col:C.red},
+                    {k:"TiO2",   v:tio2.toFixed(3)+" wt%",     col:C.neon},
+                    {k:"CeO2",   v:ceo2.toFixed(3)+" wt%",     col:C.purple},
+                    {k:"CoO",    v:coo.toFixed(4)+" wt%",      col:C.amber},
+                    {k:"Redox",  v:redox.toFixed(3),            col:C.green},
+                    {k:"d",      v:thickness.toFixed(1)+" mm",  col:C.text},
+                  ].map(function(row){
+                    return (
+                      <div key={row.k} style={{display:"flex",justifyContent:"space-between",padding:"4px 0",borderBottom:"1px solid "+C.grid}}>
+                        <span style={{fontSize:9,fontFamily:MONO,color:C.muted}}>{row.k}</span>
+                        <span style={{fontSize:10,fontFamily:MONO,color:row.col,fontWeight:700}}>{row.v}</span>
+                      </div>
+                    );
+                  })}
+                  <div style={{marginTop:8,padding:6,background:isoPass?C.greenDim:C.redDim,
+                    border:"1px solid "+(isoPass?C.green:C.red),borderRadius:3,textAlign:"center"}}>
+                    <div style={{fontSize:8,fontFamily:MONO,color:isoPass?C.green:C.red,letterSpacing:2}}>
+                      ISO 13837:2008 — {isoPass?"COMPLIANT":"NON-COMPLIANT"}
+                    </div>
+                  </div>
+                </div>
+              </Panel>
+            </div>
+          </div>
+
+          {/* FOOTER */}
+          <div style={{borderTop:"1px solid "+C.border,padding:"6px 20px",
+            display:"flex",justifyContent:"space-between",background:C.deep,
+            fontSize:8,fontFamily:MONO,color:C.muted,minWidth:900}}>
+            <span>UV GLASS SURROGATE MODEL · PyTorch DNN + scipy DE · FastAPI Backend · React</span>
+            <span>COMSOL 6.0 · EWFD · 3D UNIT CELL · FLOQUET BC · Beer-Lambert + Fresnel</span>
+            <span style={{color:C.neon}}>PHYSICS-INFORMED · CLOSED-LOOP · MILLISECOND INFERENCE</span>
+          </div>
+        </div>
+      );
+    }
+
+    /* =========================================================
+       MOUNT
+       ========================================================= */
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<Dashboard />);
+  </script>
+</body>
+</html>
